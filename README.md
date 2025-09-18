@@ -1,5 +1,5 @@
-# Google-Tasks-Data-Takeout-Re-import-via-json-and-Google-SpreadSheets
-Google Apps Script enabling a Google Spreadsheet to import Google Tasks Takeout data from json and export them back into Google Tasks
+# Google Tasks Takeout Re-import via json & Google SpreadSheets
+Google Apps Script enabling a Google Spreadsheet to import Google Tasks Takeout data from json and export them back into Google Tasks.
 
 ## Google Tasks json to Google Sheets and back to Google Tasks Utility
 This repository contains a Google Apps Script that provides a simple and powerful utility to manage tasks. It allows you to import task data from a JSON file into a Google Sheet and export a list of tasks from your sheet directly to your Google Tasks account.
