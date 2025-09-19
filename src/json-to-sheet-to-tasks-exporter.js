@@ -2,7 +2,7 @@
  * This script provides a unified utility for managing tasks between Google Sheets and Google Tasks.
  * It includes functions to:
  * - Import tasks from a JSON file into a Google Sheet.
- * - Export tasks from a Google Sheet to a Google Tasks list.
+ * - Export tasks from the current Google Sheet to a Google Tasks list.
  *
  * It uses advanced techniques like batch processing with time-based triggers and a persistent cache
  * to handle large datasets and API propagation delays without hitting quotas or execution time limits.
@@ -12,9 +12,10 @@
 
 // Define constants for the script's properties and triggers.
 const SCRIPT_PROPERTY_ROW = 'lastProcessedRow';
-const SCRIPT_PROPERTY_SHEET = 'lastProcessedSheetIndex';
+const SCRIPT_PROPERTY_SHEET_NAME = 'sourceSheetName'; // Now stores the name of the single sheet being processed
 const SCRIPT_PROPERTY_CACHE = 'taskListCache';
 const SCRIPT_PROPERTY_LIST = 'lastKnownListTitle'; // Remembers the list title across batches
+const SCRIPT_PROPERTY_REPORT = 'executionReport'; // Stores summary data
 const SCRIPT_TRIGGER_HANDLER = 'continueProcess';
 const API_DELAY_MS = 500; // Delay in milliseconds between each API call to prevent quota errors.
 const BATCH_SIZE = 100; // Process 100 rows at a time.
@@ -26,7 +27,7 @@ function onOpen() {
   const ui = SpreadsheetApp.getUi();
   ui.createMenu('Data Utilities')
     .addItem('Import JSON (from Prompt)', 'importJsonFromPrompt')
-    .addItem('Create Tasks from All Sheets', 'createTasksFromAllSheets')
+    .addItem('Create Tasks from Current Sheet', 'createTasksFromCurrentSheet') // Updated menu item
     .addToUi();
 }
 
@@ -117,51 +118,99 @@ function importJsonToSheet(rawJson) {
 }
 
 /**
- * Main function to initiate the task creation process for all sheets.
+ * Main function to initiate the task creation process for the CURRENTLY ACTIVE sheet.
  */
-function createTasksFromAllSheets() {
+function createTasksFromCurrentSheet() {
   const properties = PropertiesService.getScriptProperties();
   properties.deleteProperty(SCRIPT_PROPERTY_ROW);
-  properties.deleteProperty(SCRIPT_PROPERTY_SHEET);
+  properties.deleteProperty(SCRIPT_PROPERTY_SHEET_NAME);
   properties.deleteProperty(SCRIPT_PROPERTY_CACHE);
-  properties.deleteProperty(SCRIPT_PROPERTY_LIST); // Clear the last known list title
+  properties.deleteProperty(SCRIPT_PROPERTY_LIST);
+  properties.deleteProperty(SCRIPT_PROPERTY_REPORT);
   deleteExistingTriggers();
 
-  SpreadsheetApp.getUi().alert('Starting task creation. This may take a while for large sheets. The script will run in batches to avoid timeouts.');
+  // Get the active sheet to process
+  const activeSheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
+  const sheetName = activeSheet.getName();
+  properties.setProperty(SCRIPT_PROPERTY_SHEET_NAME, sheetName);
+
+  SpreadsheetApp.getUi().alert(`Starting task creation for sheet "${sheetName}". This may take a while. A new sheet with a summary report will be created upon completion.`);
   continueProcess();
 }
 
 /**
- * The core function that processes all sheets in batches.
- * This version "remembers" the last seen list title and uses the 'id' as a fallback for an empty 'title'.
+ * The core function that processes the selected sheet in batches.
  */
 function continueProcess() {
   const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
-  const allSheets = spreadsheet.getSheets();
-
   const properties = PropertiesService.getScriptProperties();
-  let currentSheetIndex = parseInt(properties.getProperty(SCRIPT_PROPERTY_SHEET), 10) || 0;
-  let startRow = parseInt(properties.getProperty(SCRIPT_PROPERTY_ROW), 10) || 2;
-  
-  if (currentSheetIndex >= allSheets.length) {
-    Logger.log('All tasks have been successfully created! Cleaning up triggers.');
-    properties.deleteProperty(SCRIPT_PROPERTY_ROW);
-    properties.deleteProperty(SCRIPT_PROPERTY_SHEET);
-    properties.deleteProperty(SCRIPT_PROPERTY_CACHE);
-    properties.deleteProperty(SCRIPT_PROPERTY_LIST);
-    deleteExistingTriggers();
-    return;
+
+  const sourceSheetName = properties.getProperty(SCRIPT_PROPERTY_SHEET_NAME);
+  if (!sourceSheetName) {
+      Logger.log('Error: No source sheet name found in properties. Aborting.');
+      deleteExistingTriggers();
+      return;
   }
-  
-  const sheet = allSheets[currentSheetIndex];
+  const sheet = spreadsheet.getSheetByName(sourceSheetName);
+  if (!sheet) {
+      Logger.log(`Error: Could not find sheet with name "${sourceSheetName}". Aborting.`);
+      deleteExistingTriggers();
+      return;
+  }
+
+  let startRow = parseInt(properties.getProperty(SCRIPT_PROPERTY_ROW), 10) || 2;
   const lastRow = sheet.getLastRow();
   
+  const reportDataString = properties.getProperty(SCRIPT_PROPERTY_REPORT);
+  let reportData = reportDataString ? JSON.parse(reportDataString) : {};
+
+  // Check if processing for the current sheet is complete
   if (startRow > lastRow) {
-    Logger.log(`Processing complete for sheet "${sheet.getName()}". Moving to the next sheet.`);
-    properties.setProperty(SCRIPT_PROPERTY_SHEET, (currentSheetIndex + 1).toString());
+    Logger.log('All tasks have been successfully created! Cleaning up triggers and generating report.');
+
+    // --- GENERATE REPORT SHEET (FIXED) ---
+    const timestamp = new Date().toLocaleString('sv-SE'); // YYYY-MM-DD HH:MM:SS format
+    const reportSheetName = `${sourceSheetName} Report ${timestamp}`;
+    
+    const reportSheet = spreadsheet.insertSheet(reportSheetName);
+    
+    // Write header and format
+    reportSheet.getRange('A1').setValue('Task Import Summary').setFontWeight('bold').setFontSize(14);
+    reportSheet.getRange('A1:D1').merge().setHorizontalAlignment('center');
+
+    reportSheet.getRange('A2').setValue('Generated on:');
+    reportSheet.getRange('B2').setValue(new Date());
+
+    // Write table headers
+    reportSheet.getRange('A4:D4').setValues([['Task List', 'Total Imported', 'Completed', 'Needs Action']]).setFontWeight('bold');
+
+    // Prepare and write table content
+    const tableContent = [];
+    const listNames = Object.keys(reportData);
+    if (listNames.length > 0) {
+        for (const listName of listNames) {
+            const stats = reportData[listName];
+            tableContent.push([listName, stats.total, stats.completed, stats.needsAction]);
+        }
+    } else {
+        tableContent.push(['No new tasks were imported.', '', '', '']);
+    }
+
+    if (tableContent.length > 0) {
+        reportSheet.getRange(5, 1, tableContent.length, tableContent[0].length).setValues(tableContent);
+    }
+
+    // Auto-resize columns for readability
+    reportSheet.autoResizeColumns(1, 4);
+    reportSheet.activate(); // Make the report sheet visible to the user
+
+    // Final cleanup of all script properties
     properties.deleteProperty(SCRIPT_PROPERTY_ROW);
-    properties.deleteProperty(SCRIPT_PROPERTY_LIST); // Reset list title for new sheet
-    createTrigger();
+    properties.deleteProperty(SCRIPT_PROPERTY_SHEET_NAME);
+    properties.deleteProperty(SCRIPT_PROPERTY_CACHE);
+    properties.deleteProperty(SCRIPT_PROPERTY_LIST);
+    properties.deleteProperty(SCRIPT_PROPERTY_REPORT);
+    deleteExistingTriggers();
     return;
   }
 
@@ -185,7 +234,7 @@ function continueProcess() {
   const lastColumn = sheet.getLastColumn();
   const headers = sheet.getRange(1, 1, 1, lastColumn).getValues()[0];
   const titleIndex = headers.indexOf('title');
-  const idIndex = headers.indexOf('id'); // Get the index for the ID column
+  const idIndex = headers.indexOf('id');
   const listTitleIndex = headers.indexOf('list_title');
   const statusIndex = headers.indexOf('status');
   const dueIndex = headers.indexOf('due');
@@ -193,9 +242,7 @@ function continueProcess() {
 
   if (titleIndex === -1 || listTitleIndex === -1) {
     Logger.log(`Skipping sheet "${sheet.getName()}". Required headers 'title' or 'list_title' not found.`);
-    properties.setProperty(SCRIPT_PROPERTY_SHEET, (currentSheetIndex + 1).toString());
-    properties.deleteProperty(SCRIPT_PROPERTY_ROW);
-    createTrigger();
+    deleteExistingTriggers(); // Stop if headers are missing
     return;
   }
 
@@ -206,21 +253,18 @@ function continueProcess() {
     const currentRowNumber = startRow + j;
     const row = data[j];
     
-    // Remember the last seen list title
     const listTitleFromCell = row[listTitleIndex] ? row[listTitleIndex].toString().trim() : null;
     if (listTitleFromCell) {
       lastKnownListTitle = listTitleFromCell;
     }
     const taskListName = lastKnownListTitle;
     
-    // *** MODIFIED LOGIC: Use ID as fallback for Title ***
     const taskTitleFromCell = row[titleIndex] ? row[titleIndex].toString().trim() : null;
     const taskIdFromCell = idIndex !== -1 && row[idIndex] ? row[idIndex].toString().trim() : null;
-    const finalTaskTitle = taskTitleFromCell || taskIdFromCell; // Prioritize title, fallback to ID
-    // *** END OF MODIFIED LOGIC ***
+    const finalTaskTitle = taskTitleFromCell || taskIdFromCell;
 
     if (!taskListName) {
-      Logger.log(`Row ${currentRowNumber}: Skipped because no 'list_title' has been found yet in this sheet.`);
+      Logger.log(`Row ${currentRowNumber}: Skipped because no 'list_title' has been found yet.`);
       continue;
     }
     if (!finalTaskTitle) {
@@ -236,7 +280,7 @@ function continueProcess() {
 
     if (currentTaskListId) {
       const task = Tasks.newTask();
-      task.title = finalTaskTitle; // Use the determined title
+      task.title = finalTaskTitle;
 
       if (statusIndex !== -1 && row[statusIndex] && row[statusIndex].toString().toLowerCase().trim() === 'completed') {
         task.status = 'completed';
@@ -258,6 +302,18 @@ function continueProcess() {
       try {
         Tasks.Tasks.insert(task, currentTaskListId);
         Logger.log(`Row ${currentRowNumber}: Successfully created task "${finalTaskTitle}" in list "${taskListName}".`);
+        
+        // --- UPDATE REPORT DATA ---
+        if (!reportData[taskListName]) {
+            reportData[taskListName] = { completed: 0, needsAction: 0, total: 0 };
+        }
+        if (task.status === 'completed') {
+            reportData[taskListName].completed++;
+        } else {
+            reportData[taskListName].needsAction++;
+        }
+        reportData[taskListName].total++;
+        
         Utilities.sleep(API_DELAY_MS);
       } catch (e) {
         Logger.log(`Row ${currentRowNumber}: FAILED to create task "${finalTaskTitle}". Error: ${e.message}`);
@@ -269,10 +325,10 @@ function continueProcess() {
 
   const nextStartRow = startRow + rowsToProcess;
   properties.setProperty(SCRIPT_PROPERTY_ROW, nextStartRow.toString());
-  properties.setProperty(SCRIPT_PROPERTY_SHEET, currentSheetIndex.toString());
   properties.setProperty(SCRIPT_PROPERTY_CACHE, JSON.stringify(taskListCache));
+  properties.setProperty(SCRIPT_PROPERTY_REPORT, JSON.stringify(reportData));
   if(lastKnownListTitle) {
-      properties.setProperty(SCRIPT_PROPERTY_LIST, lastKnownListTitle); // Save the last title for the next batch
+      properties.setProperty(SCRIPT_PROPERTY_LIST, lastKnownListTitle);
   }
   createTrigger();
   Logger.log(`Processing complete for batch. Next batch will start at row ${nextStartRow}.`);
@@ -280,10 +336,6 @@ function continueProcess() {
 
 /**
  * Helper function to find or create a task list by name using a persistent cache.
- * This version includes a fallback mechanism to handle API race conditions.
- * @param {string} name The name of the task list to find or create.
- * @param {Object<string, string>} cache A map of task list titles to their IDs, passed by reference.
- * @return {string | null} The ID of the task list, or null if creation fails.
  */
 function getTaskListIdByName(name, cache) {
   if (cache[name]) {
@@ -318,7 +370,7 @@ function getTaskListIdByName(name, cache) {
                 }
             }
         }
-        Logger.log(`Still could not find task list "${name}" after re-fetching. No tasks will be created for this list in this batch.`);
+        Logger.log(`Still could not find task list "${name}" after re-fetching.`);
         return null;
     } catch (e2) {
         Logger.log(`Failed to re-fetch task lists. Error: ${e2.message}`);
