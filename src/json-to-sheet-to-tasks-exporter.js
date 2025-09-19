@@ -1,214 +1,348 @@
 /**
- * This script provides a simple utility to manage data between a Google Sheet
- * and Google Tasks. It imports JSON data into a sheet and exports tasks
- * from the active sheet to Google Tasks.
+ * This script provides a unified utility for managing tasks between Google Sheets and Google Tasks.
+ * It includes functions to:
+ * - Import tasks from a JSON file into a Google Sheet.
+ * - Export tasks from a Google Sheet to a Google Tasks list.
  *
- * @author Gemini
+ * It uses advanced techniques like batch processing with time-based triggers and a persistent cache
+ * to handle large datasets and API propagation delays without hitting quotas or execution time limits.
+ *
+ * @author Gemini (with optimizations)
  */
+
+// Define constants for the script's properties and triggers.
+const SCRIPT_PROPERTY_ROW = 'lastProcessedRow';
+const SCRIPT_PROPERTY_SHEET = 'lastProcessedSheetIndex';
+const SCRIPT_PROPERTY_CACHE = 'taskListCache';
+const SCRIPT_PROPERTY_LIST = 'lastKnownListTitle'; // Remembers the list title across batches
+const SCRIPT_TRIGGER_HANDLER = 'continueProcess';
+const API_DELAY_MS = 500; // Delay in milliseconds between each API call to prevent quota errors.
+const BATCH_SIZE = 100; // Process 100 rows at a time.
 
 /**
  * Creates a custom menu in the Google Sheet for running the script.
  */
 function onOpen() {
   const ui = SpreadsheetApp.getUi();
-  const menu = ui.createMenu('Data Utilities');
-  
-  // Add only the two requested menu items.
-  menu.addItem('Create Tasks from Sheet', 'createTasksFromSheet');
-  menu.addSeparator();
-  menu.addItem('Import JSON (from Prompt)', 'importJsonToSheet');
-  menu.addToUi();
+  ui.createMenu('Data Utilities')
+    .addItem('Import JSON (from Prompt)', 'importJsonFromPrompt')
+    .addItem('Create Tasks from All Sheets', 'createTasksFromAllSheets')
+    .addToUi();
 }
 
 /**
- * Main function to initiate the task creation process for the active sheet.
+ * Initiates the JSON import process by prompting the user for data.
  */
-function createTasksFromSheet() {
-  const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
-  const activeSheet = spreadsheet.getActiveSheet();
-  
+function importJsonFromPrompt() {
   const ui = SpreadsheetApp.getUi();
-  ui.alert(`Starting task creation for sheet "${activeSheet.getName()}".`);
-  
-  // Get the headers to dynamically find the correct columns.
-  const headers = activeSheet.getRange(1, 1, 1, activeSheet.getLastColumn()).getValues()[0];
-  const headerMap = {};
-  headers.forEach((header, index) => {
-    headerMap[header.toString().trim().toLowerCase()] = index + 1;
-  });
+  const promptResponse = ui.prompt(
+    'Import JSON Data',
+    'Paste the JSON data here:',
+    ui.ButtonSet.OK_CANCEL
+  );
 
-  // Dynamically get the column numbers based on header names.
-  const getCol = (headerName) => {
-    const col = headerMap[headerName.toLowerCase()];
-    if (!col) {
-      Logger.log(`Error: Missing required header column "${headerName}".`);
-      SpreadsheetApp.getUi().alert(`Error: Missing required header column "${headerName}". Please check your sheet.`);
-      return null;
+  if (promptResponse.getSelectedButton() === ui.Button.OK) {
+    const rawJson = promptResponse.getResponseText();
+    if (rawJson) {
+      importJsonToSheet(rawJson);
+    } else {
+      ui.alert('No JSON data was entered. Please try again.');
     }
-    return col;
-  };
+  }
+}
 
-  const taskTitleColumn = getCol('title');
-  const taskDueDateColumn = getCol('due');
-  const taskStatusColumn = getCol('status');
-  const taskStarredColumn = getCol('links'); // The JSON export puts starred status in the links field.
-  const taskLinkColumn = getCol('links');
-  const taskListNameColumn = getCol('list_title'); // The JSON import puts the task list name in the list_title field.
+/**
+ * Main function to import JSON data into the active spreadsheet.
+ * @param {string} rawJson The raw JSON string to be parsed.
+ */
+function importJsonToSheet(rawJson) {
+  const ui = SpreadsheetApp.getUi();
+  try {
+    const data = JSON.parse(rawJson);
+    if (!Array.isArray(data) || data.length === 0) {
+      ui.alert('Invalid JSON data. Please ensure it is a non-empty array of objects.');
+      return;
+    }
 
-  if (!taskTitleColumn || !taskListNameColumn) {
+    const sheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
+    sheet.clear(); // Clear existing content before importing.
+
+    const allHeaders = new Set();
+    data.forEach(item => {
+      Object.keys(item).forEach(key => allHeaders.add(key));
+      if (Array.isArray(item.items)) {
+        item.items.forEach(task => {
+          Object.keys(task).forEach(key => allHeaders.add(key));
+        });
+      }
+    });
+
+    const orderedHeaders = [
+      'list_title', 'list_id', 'id', 'title', 'status', 'created', 'updated', 'due', 'links', 'task_type', 'kind', 'selfLink'
+    ];
+    const finalHeaders = orderedHeaders.filter(header => allHeaders.has(header));
+
+    const outputData = [finalHeaders];
+
+    data.forEach(taskList => {
+      const listTitle = taskList.title;
+      const listId = taskList.id;
+
+      if (Array.isArray(taskList.items) && taskList.items.length > 0) {
+        taskList.items.forEach(task => {
+          const row = finalHeaders.map(header => {
+            if (header === 'list_title') return listTitle;
+            if (header === 'list_id') return listId;
+            return task[header] !== undefined ? task[header] : '';
+          });
+          outputData.push(row);
+        });
+      } else {
+        const emptyRow = finalHeaders.map(header => {
+          if (header === 'list_title') return listTitle;
+          if (header === 'list_id') return listId;
+          return '';
+        });
+        outputData.push(emptyRow);
+      }
+    });
+
+    sheet.getRange(1, 1, outputData.length, outputData[0].length).setValues(outputData);
+    ui.alert(`Import complete! Successfully imported ${outputData.length - 1} records to the sheet.`);
+
+  } catch (e) {
+    ui.alert(`An error occurred: ${e.message}`);
+    Logger.log(e);
+  }
+}
+
+/**
+ * Main function to initiate the task creation process for all sheets.
+ */
+function createTasksFromAllSheets() {
+  const properties = PropertiesService.getScriptProperties();
+  properties.deleteProperty(SCRIPT_PROPERTY_ROW);
+  properties.deleteProperty(SCRIPT_PROPERTY_SHEET);
+  properties.deleteProperty(SCRIPT_PROPERTY_CACHE);
+  properties.deleteProperty(SCRIPT_PROPERTY_LIST); // Clear the last known list title
+  deleteExistingTriggers();
+
+  SpreadsheetApp.getUi().alert('Starting task creation. This may take a while for large sheets. The script will run in batches to avoid timeouts.');
+  continueProcess();
+}
+
+/**
+ * The core function that processes all sheets in batches.
+ * This version "remembers" the last seen list title to handle grouped task data.
+ */
+function continueProcess() {
+  const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+  const allSheets = spreadsheet.getSheets();
+
+  const properties = PropertiesService.getScriptProperties();
+  let currentSheetIndex = parseInt(properties.getProperty(SCRIPT_PROPERTY_SHEET), 10) || 0;
+  let startRow = parseInt(properties.getProperty(SCRIPT_PROPERTY_ROW), 10) || 2;
+  
+  if (currentSheetIndex >= allSheets.length) {
+    Logger.log('All tasks have been successfully created! Cleaning up triggers.');
+    properties.deleteProperty(SCRIPT_PROPERTY_ROW);
+    properties.deleteProperty(SCRIPT_PROPERTY_SHEET);
+    properties.deleteProperty(SCRIPT_PROPERTY_CACHE);
+    properties.deleteProperty(SCRIPT_PROPERTY_LIST);
+    deleteExistingTriggers();
+    return;
+  }
+  
+  const sheet = allSheets[currentSheetIndex];
+  const lastRow = sheet.getLastRow();
+  
+  if (startRow > lastRow) {
+    Logger.log(`Processing complete for sheet "${sheet.getName()}". Moving to the next sheet.`);
+    properties.setProperty(SCRIPT_PROPERTY_SHEET, (currentSheetIndex + 1).toString());
+    properties.deleteProperty(SCRIPT_PROPERTY_ROW);
+    properties.deleteProperty(SCRIPT_PROPERTY_LIST); // Reset list title for new sheet
+    createTrigger();
     return;
   }
 
-  const lastRow = activeSheet.getLastRow();
-  const data = activeSheet.getRange(2, 1, lastRow - 1, activeSheet.getLastColumn()).getValues();
+  Logger.log(`Starting process. Sheet: "${sheet.getName()}", Starting row: ${startRow}`);
+  
+  let cacheString = properties.getProperty(SCRIPT_PROPERTY_CACHE);
+  let taskListCache = cacheString ? JSON.parse(cacheString) : {};
+  let lastKnownListTitle = properties.getProperty(SCRIPT_PROPERTY_LIST) || null;
 
-  let currentTaskList = null;
+  try {
+    const taskLists = Tasks.Tasklists.list().items;
+    if (taskLists) {
+      taskLists.forEach(list => {
+        taskListCache[list.title] = list.id;
+      });
+    }
+  } catch (e) {
+    Logger.log(`Could not retrieve task lists to update cache: ${e.message}. Proceeding with stored cache.`);
+  }
 
-  // Loop through each row of data.
-  for (let i = 0; i < data.length; i++) {
-    const row = data[i];
+  const lastColumn = sheet.getLastColumn();
+  const headers = sheet.getRange(1, 1, 1, lastColumn).getValues()[0];
+  const titleIndex = headers.indexOf('title');
+  const listTitleIndex = headers.indexOf('list_title');
+  const statusIndex = headers.indexOf('status');
+  const dueIndex = headers.indexOf('due');
+  const linksIndex = headers.indexOf('links');
+
+  if (titleIndex === -1 || listTitleIndex === -1) {
+    Logger.log(`Skipping sheet "${sheet.getName()}". Required headers 'title' or 'list_title' not found.`);
+    properties.setProperty(SCRIPT_PROPERTY_SHEET, (currentSheetIndex + 1).toString());
+    properties.deleteProperty(SCRIPT_PROPERTY_ROW);
+    createTrigger();
+    return;
+  }
+
+  const rowsToProcess = Math.min(BATCH_SIZE, lastRow - startRow + 1);
+  const data = sheet.getRange(startRow, 1, rowsToProcess, lastColumn).getValues();
+
+  for (let j = 0; j < data.length; j++) {
+    const currentRowNumber = startRow + j;
+    const row = data[j];
     
-    // Check if the row represents a task list.
-    const rowTitle = row[taskTitleColumn - 1];
-    if (typeof rowTitle === 'string' && rowTitle.trim().toLowerCase().startsWith("list")) {
-      const listName = row[taskListNameColumn - 1];
-      if (listName) {
-        currentTaskList = getTaskListByName(listName.toString().trim());
-      }
-      continue; // Skip to the next row as this is a list row, not a task.
+    // *** LOGIC TO REMEMBER THE LIST TITLE ***
+    const listTitleFromCell = row[listTitleIndex] ? row[listTitleIndex].toString().trim() : null;
+    if (listTitleFromCell) {
+      lastKnownListTitle = listTitleFromCell; // Update the remembered title
+    }
+    const taskListName = lastKnownListTitle; // Use the remembered title
+    // *** END OF NEW LOGIC ***
+    
+    const taskTitle = row[titleIndex] ? row[titleIndex].toString().trim() : null;
+
+    if (!taskListName) {
+      Logger.log(`Row ${currentRowNumber}: Skipped because no 'list_title' has been found yet in this sheet.`);
+      continue;
+    }
+    if (!taskTitle) {
+      Logger.log(`Row ${currentRowNumber}: Skipped because the 'title' is empty.`);
+      continue;
+    }
+    if (taskTitle.toLowerCase().startsWith('list:')) {
+        Logger.log(`Row ${currentRowNumber}: Skipped because it appears to be a list definition row.`);
+        continue;
     }
 
-    const taskTitle = row[taskTitleColumn - 1];
-    if (taskTitle && currentTaskList) { // Only create a task if the title is not empty and a task list is defined.
+    const currentTaskListId = getTaskListIdByName(taskListName, taskListCache);
+
+    if (currentTaskListId) {
       const task = Tasks.newTask();
-      
-      // Ensure the task title is a string.
-      const taskStarred = row[getCol('links') - 1];
-      if (taskStarred && typeof taskStarred === 'string' && taskStarred.toString().toLowerCase().includes('starred')) {
-        task.title = `⭐ ${taskTitle.toString()}`;
-      } else {
-        task.title = taskTitle.toString();
-      }
-      
-      // Add a check for a valid date before setting the 'due' property.
-      const taskDueDate = row[getCol('due') - 1];
-      if (taskDueDate instanceof Date && !isNaN(taskDueDate.getTime())) {
-        task.due = taskDueDate.toISOString();
-      } else {
-        try {
-          const parsedDate = new Date(taskDueDate);
-          if (!isNaN(parsedDate.getTime())) {
-            task.due = parsedDate.toISOString();
-          }
-        } catch (e) {
-          Logger.log(`Skipping due date for "${taskTitle}" due to invalid value: "${taskDueDate}". Error: ${e.message}`);
-        }
-      }
+      task.title = taskTitle;
 
-      // Add the link to the task's notes (description) if it exists.
-      const taskLink = row[getCol('links') - 1];
-      if (typeof taskLink === 'string' && taskLink.trim() !== '' && taskLink.toString().toLowerCase() !== 'starred') {
-        task.notes = `Link: ${taskLink.trim()}`;
-      }
-
-      // Check if the status is 'completed' and set the task status.
-      const taskStatus = row[getCol('status') - 1];
-      if (taskStatus && taskStatus.toString().toLowerCase().trim() === 'completed') {
+      if (statusIndex !== -1 && row[statusIndex] && row[statusIndex].toString().toLowerCase().trim() === 'completed') {
         task.status = 'completed';
       }
-      
-      Tasks.Tasks.insert(task, currentTaskList.id);
-      
-      // Add a small delay to avoid hitting the API rate limit.
-      Utilities.sleep(500);
+
+      if (dueIndex !== -1 && row[dueIndex]) {
+        try {
+          const dueDate = new Date(row[dueIndex]);
+          if (!isNaN(dueDate.getTime())) {
+            task.due = dueDate.toISOString();
+          }
+        } catch (e) { /* Ignore invalid dates */ }
+      }
+
+      if (linksIndex !== -1 && row[linksIndex]) {
+        task.notes = `Link: ${row[linksIndex]}`;
+      }
+
+      try {
+        Tasks.Tasks.insert(task, currentTaskListId);
+        Logger.log(`Row ${currentRowNumber}: Successfully created task "${taskTitle}" in list "${taskListName}".`);
+        Utilities.sleep(API_DELAY_MS);
+      } catch (e) {
+        Logger.log(`Row ${currentRowNumber}: FAILED to create task "${taskTitle}". Error: ${e.message}`);
+      }
+    } else {
+      Logger.log(`Row ${currentRowNumber}: Skipped because an ID could not be found or created for task list "${taskListName}".`);
     }
   }
 
-  ui.alert('All tasks have been successfully created!');
-}
-
-/**
- * Prompts the user for a JSON string and imports it into the active sheet.
- */
-function importJsonToSheet() {
-  const ui = SpreadsheetApp.getUi();
-  const response = ui.prompt('Import JSON', 'Paste your JSON data below:', ui.ButtonSet.OK_CANCEL);
-  if (response.getSelectedButton() !== ui.Button.OK) { return; }
-
-  let data;
-  try {
-    data = JSON.parse(response.getResponseText());
-  } catch (e) {
-    ui.alert('Error', 'Invalid JSON data. Please check the format and try again.', ui.ButtonSet.OK);
-    return;
+  const nextStartRow = startRow + rowsToProcess;
+  properties.setProperty(SCRIPT_PROPERTY_ROW, nextStartRow.toString());
+  properties.setProperty(SCRIPT_PROPERTY_SHEET, currentSheetIndex.toString());
+  properties.setProperty(SCRIPT_PROPERTY_CACHE, JSON.stringify(taskListCache));
+  if(lastKnownListTitle) {
+      properties.setProperty(SCRIPT_PROPERTY_LIST, lastKnownListTitle); // Save the last title for the next batch
   }
-  
-  importDataToSheet(data, 'JSON data has been successfully imported.');
+  createTrigger();
+  Logger.log(`Processing complete for batch. Next batch will start at row ${nextStartRow}.`);
 }
 
 /**
- * A helper function to handle the core logic of importing data to the sheet.
- * @param {Array} data The data array to import.
- * @param {string} successMessage The message to display on success.
- */
-function importDataToSheet(data, successMessage) {
-  const targetSheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
-  if (!Array.isArray(data) || data.length === 0) {
-    SpreadsheetApp.getUi().alert('Invalid data format. Please ensure it is a non-empty array of objects.');
-    return;
-  }
-  
-  targetSheet.clear();
-  const headers = Object.keys(data[0]);
-  const outputData = [headers];
-  
-  data.forEach(item => {
-    const row = headers.map(header => {
-      const value = item[header];
-      if (typeof value === 'object' && value !== null) {
-        if (value.url) return value.url;
-        if (value.href) return value.href;
-        if (value.link) return value.link;
-        return JSON.stringify(value);
-      }
-      return value;
-    });
-    outputData.push(row);
-  });
-  
-  const range = targetSheet.getRange(1, 1, outputData.length, outputData[0].length);
-  range.setValues(outputData);
-  targetSheet.autoResizeColumns(1, targetSheet.getLastColumn());
-  SpreadsheetApp.getUi().alert(successMessage);
-}
-
-/**
- * Helper function to find or create a task list by name.
+ * Helper function to find or create a task list by name using a persistent cache.
+ * This version includes a fallback mechanism to handle API race conditions.
  * @param {string} name The name of the task list to find or create.
- * @return {Object} The task list object.
+ * @param {Object<string, string>} cache A map of task list titles to their IDs, passed by reference.
+ * @return {string | null} The ID of the task list, or null if creation fails.
  */
-function getTaskListByName(name) {
-  let taskList = null;
-  const taskLists = Tasks.Tasklists.list().items;
-  
-  if (taskLists) {
-    for (let i = 0; i < taskLists.length; i++) {
-      if (taskLists[i].title === name) {
-        taskList = taskLists[i];
-        break;
-      }
-    }
+function getTaskListIdByName(name, cache) {
+  if (cache[name]) {
+    return cache[name];
   }
-  
-  if (!taskList) {
+
+  try {
+    const newTaskList = Tasks.newTaskList();
+    newTaskList.title = name;
+    const createdList = Tasks.Tasklists.insert(newTaskList);
+    
+    if (createdList && createdList.id) {
+        cache[name] = createdList.id; 
+        Logger.log(`Created new task list and added to cache: "${name}"`);
+        return createdList.id;
+    }
+    Logger.log(`Failed to create task list "${name}" - API did not return an ID.`);
+    return null;
+  } catch (e) {
+    Logger.log(`Could not create list "${name}" (it may already exist). Error: ${e.message}. Attempting to find it by re-fetching all lists.`);
+    
+    Utilities.sleep(2000); 
+
     try {
-      const newTaskList = Tasks.newTaskList();
-      newTaskList.title = name;
-      taskList = Tasks.Tasklists.insert(newTaskList);
-    } catch (e) {
-      Logger.log(`Failed to create task list: ${e.message}`);
+        const taskLists = Tasks.Tasklists.list().items;
+        if (taskLists) {
+            for (const list of taskLists) {
+                if (list.title === name) {
+                    Logger.log(`Found existing list "${name}" after re-fetching.`);
+                    cache[name] = list.id;
+                    return list.id;
+                }
+            }
+        }
+        Logger.log(`Still could not find task list "${name}" after re-fetching. No tasks will be created for this list in this batch.`);
+        return null;
+    } catch (e2) {
+        Logger.log(`Failed to re-fetch task lists. Error: ${e2.message}`);
+        return null;
     }
   }
-  
-  return taskList;
 }
+
+/**
+ * Helper function to create a new time-based trigger.
+ */
+function createTrigger() {
+  deleteExistingTriggers();
+  ScriptApp.newTrigger(SCRIPT_TRIGGER_HANDLER)
+    .timeBased()
+    .at(new Date(Date.now() + 60 * 1000)) // 1 minute from now
+    .create();
+}
+
+/**
+ * Helper function to delete any existing triggers for this script.
+ */
+function deleteExistingTriggers() {
+  const allTriggers = ScriptApp.getProjectTriggers();
+  for (const trigger of allTriggers) {
+    if (trigger.getHandlerFunction() === SCRIPT_TRIGGER_HANDLER) {
+      ScriptApp.deleteTrigger(trigger);
+    }
+  }
+}
+
