@@ -133,7 +133,7 @@ function createTasksFromAllSheets() {
 
 /**
  * The core function that processes all sheets in batches.
- * This version "remembers" the last seen list title to handle grouped task data.
+ * This version "remembers" the last seen list title and uses the 'id' as a fallback for an empty 'title'.
  */
 function continueProcess() {
   const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
@@ -185,6 +185,7 @@ function continueProcess() {
   const lastColumn = sheet.getLastColumn();
   const headers = sheet.getRange(1, 1, 1, lastColumn).getValues()[0];
   const titleIndex = headers.indexOf('title');
+  const idIndex = headers.indexOf('id'); // Get the index for the ID column
   const listTitleIndex = headers.indexOf('list_title');
   const statusIndex = headers.indexOf('status');
   const dueIndex = headers.indexOf('due');
@@ -205,25 +206,28 @@ function continueProcess() {
     const currentRowNumber = startRow + j;
     const row = data[j];
     
-    // *** LOGIC TO REMEMBER THE LIST TITLE ***
+    // Remember the last seen list title
     const listTitleFromCell = row[listTitleIndex] ? row[listTitleIndex].toString().trim() : null;
     if (listTitleFromCell) {
-      lastKnownListTitle = listTitleFromCell; // Update the remembered title
+      lastKnownListTitle = listTitleFromCell;
     }
-    const taskListName = lastKnownListTitle; // Use the remembered title
-    // *** END OF NEW LOGIC ***
+    const taskListName = lastKnownListTitle;
     
-    const taskTitle = row[titleIndex] ? row[titleIndex].toString().trim() : null;
+    // *** MODIFIED LOGIC: Use ID as fallback for Title ***
+    const taskTitleFromCell = row[titleIndex] ? row[titleIndex].toString().trim() : null;
+    const taskIdFromCell = idIndex !== -1 && row[idIndex] ? row[idIndex].toString().trim() : null;
+    const finalTaskTitle = taskTitleFromCell || taskIdFromCell; // Prioritize title, fallback to ID
+    // *** END OF MODIFIED LOGIC ***
 
     if (!taskListName) {
       Logger.log(`Row ${currentRowNumber}: Skipped because no 'list_title' has been found yet in this sheet.`);
       continue;
     }
-    if (!taskTitle) {
-      Logger.log(`Row ${currentRowNumber}: Skipped because the 'title' is empty.`);
+    if (!finalTaskTitle) {
+      Logger.log(`Row ${currentRowNumber}: Skipped because both 'title' and 'id' are empty.`);
       continue;
     }
-    if (taskTitle.toLowerCase().startsWith('list:')) {
+    if (finalTaskTitle.toLowerCase().startsWith('list:')) {
         Logger.log(`Row ${currentRowNumber}: Skipped because it appears to be a list definition row.`);
         continue;
     }
@@ -232,7 +236,7 @@ function continueProcess() {
 
     if (currentTaskListId) {
       const task = Tasks.newTask();
-      task.title = taskTitle;
+      task.title = finalTaskTitle; // Use the determined title
 
       if (statusIndex !== -1 && row[statusIndex] && row[statusIndex].toString().toLowerCase().trim() === 'completed') {
         task.status = 'completed';
@@ -253,10 +257,10 @@ function continueProcess() {
 
       try {
         Tasks.Tasks.insert(task, currentTaskListId);
-        Logger.log(`Row ${currentRowNumber}: Successfully created task "${taskTitle}" in list "${taskListName}".`);
+        Logger.log(`Row ${currentRowNumber}: Successfully created task "${finalTaskTitle}" in list "${taskListName}".`);
         Utilities.sleep(API_DELAY_MS);
       } catch (e) {
-        Logger.log(`Row ${currentRowNumber}: FAILED to create task "${taskTitle}". Error: ${e.message}`);
+        Logger.log(`Row ${currentRowNumber}: FAILED to create task "${finalTaskTitle}". Error: ${e.message}`);
       }
     } else {
       Logger.log(`Row ${currentRowNumber}: Skipped because an ID could not be found or created for task list "${taskListName}".`);
